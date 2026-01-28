@@ -1,5 +1,8 @@
 name: Docker Release
 
+# This workflow is disabled in favor of sync-and-build.yml
+if: false
+
 on:
   push:
     branches:
