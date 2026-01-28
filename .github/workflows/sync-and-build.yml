@@ -1,0 +1,178 @@
+name: Sync and Build
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+  UPSTREAM_REPO: moltbot/moltbot
+
+jobs:
+  check-upstream:
+    runs-on: ubuntu-latest
+    outputs:
+      new-release: ${{ steps.check.outputs.new-release }}
+      latest-tag: ${{ steps.check.outputs.latest-tag }}
+      latest-version: ${{ steps.check.outputs.latest-version }}
+    steps:
+      - name: Check upstream releases
+        id: check
+        run: |
+          echo "Checking for new releases from ${{ env.UPSTREAM_REPO }}..."
+          
+          LATEST_TAG=$(gh api repos/${{ env.UPSTREAM_REPO }}/releases/latest --jq '.tag_name')
+          echo "Latest tag: $LATEST_TAG"
+          
+          CURRENT_TAG=$(gh api repos/${{ github.repository }}/releases/latest --jq '.tag_name' 2>/dev/null || echo "")
+          echo "Current tag: $CURRENT_TAG"
+          
+          if [ "$LATEST_TAG" != "$CURRENT_TAG" ]; then
+            echo "New release available: $LATEST_TAG"
+            echo "new-release=true" >> $GITHUB_OUTPUT
+            echo "latest-tag=$LATEST_TAG" >> $GITHUB_OUTPUT
+            echo "latest-version=${LATEST_TAG#v}" >> $GITHUB_OUTPUT
+          else
+            echo "No new release"
+            echo "new-release=false" >> $GITHUB_OUTPUT
+            echo "latest-tag=$LATEST_TAG" >> $GITHUB_OUTPUT
+            echo "latest-version=${LATEST_TAG#v}" >> $GITHUB_OUTPUT
+          fi
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  sync-upstream:
+    needs: check-upstream
+    if: needs.check-upstream.outputs.new-release == 'true'
+    runs-on: ubuntu-latest
+    outputs:
+      synced-tag: ${{ steps.sync.outputs.synced-tag }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Fetch upstream
+        run: |
+          git remote add upstream https://github.com/${{ env.UPSTREAM_REPO }}.git
+          git fetch upstream --tags
+
+      - name: Sync upstream tag
+        id: sync
+        run: |
+          TAG=${{ needs.check-upstream.outputs.latest-tag }}
+          echo "Syncing tag: $TAG"
+          
+          git checkout main
+          git merge upstream/main --no-edit || git merge upstream/main --allow-unrelated-histories --no-edit
+          
+          git tag -f $TAG refs/tags/$TAG
+          git push origin main --force-with-lease
+          git push origin $TAG --force
+          
+          echo "synced-tag=$TAG" >> $GITHUB_OUTPUT
+
+  build-main:
+    needs: sync-upstream
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+      contents: read
+    outputs:
+      image-digest: ${{ steps.build.outputs.digest }}
+      image-tag: ${{ needs.sync-upstream.outputs.synced-tag }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=semver,pattern={{version}},value=${{ needs.sync-upstream.outputs.synced-tag }}
+            type=raw,value=latest
+            type=raw,value=${{ needs.sync-upstream.outputs.synced-tag }}
+
+      - name: Build and push main image
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          labels: ${{ steps.meta.outputs.labels }}
+          tags: ${{ steps.meta.outputs.tags }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: false
+          push: true
+
+  build-sandbox:
+    needs: sync-upstream
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+      contents: read
+    outputs:
+      image-digest: ${{ steps.build.outputs.digest }}
+      image-tag: ${{ needs.sync-upstream.outputs.synced-tag }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-sandbox
+          tags: |
+            type=semver,pattern={{version}},value=${{ needs.sync-upstream.outputs.synced-tag }}
+            type=raw,value=latest
+            type=raw,value=${{ needs.sync-upstream.outputs.synced-tag }}
+
+      - name: Build and push sandbox image
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.sandbox
+          platforms: linux/amd64
+          labels: ${{ steps.meta.outputs.labels }}
+          tags: ${{ steps.meta.outputs.tags }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: false
+          push: true
